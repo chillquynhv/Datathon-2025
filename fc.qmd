@@ -1,0 +1,492 @@
+---
+title: "forecasting"
+format: html
+editor: visual
+---
+
+## Files Input
+
+```{r}
+library(readxl)
+visitation <- read_excel("2025 Allianz Datathon Dataset.xlsx", sheet = "Visitation Data")
+climate <- read_excel("2025 Allianz Datathon Dataset.xlsx", sheet = "Climate Data")
+climate_winter <- subset(climate, Month >= 6 & Month <= 9)
+```
+
+## Missing values (with Climate)
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(zoo)
+# 1) Create Date variable
+climate_winter2 <- climate_winter %>%
+  mutate(
+    Date = make_date(Year, Month, Day)
+  ) %>%
+  arrange(`Bureau of Meteorology station number`, Date)
+# Columns that need dealing with NA
+num_cols <- c("Maximum temperature (Degree C)",
+              "Minimum temperature (Degree C)",
+              "Rainfall amount (millimetres)")
+
+# 2) linear interpolation (5 NA 7 8 9 10 -> NA = 6) 
+# Not applicable for NA at the begin/end of dataset
+climate_interp <- climate_winter2 %>%
+  group_by(`Bureau of Meteorology station number`) %>%
+  mutate(across(all_of(num_cols),
+                ~ na.approx(., x = Date, na.rm = FALSE))) %>%
+  ungroup()
+
+# 3) Fill in the NA at the begin/end of dataset by median
+climate_imputed <- climate_interp %>%
+  group_by(`Bureau of Meteorology station number`, Month) %>%
+  mutate(across(all_of(num_cols),
+                ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+# 4) Check NA
+sapply(climate_imputed[ , num_cols], function(x) sum(is.na(x)))
+```
+
+## Dealing with outliers by winsorization
+
+```{r}
+winsorize <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR
+  upper <- Q3 + 1.5 * IQR
+  x[x < lower] <- lower
+  x[x > upper] <- upper
+  return(x)
+}
+```
+
+```{r}
+climate_no_outlier <- climate_imputed %>%
+  mutate(
+    `Maximum temperature (Degree C)` = winsorize(`Maximum temperature (Degree C)`),
+    `Minimum temperature (Degree C)` = winsorize(`Minimum temperature (Degree C)`),
+    `Rainfall amount (millimetres)` = winsorize(`Rainfall amount (millimetres)`)
+  )
+
+```
+
+```{r}
+# Winsorize cho visitation
+resort_cols <- setdiff(names(visitation), c("Year","Week"))
+
+visitation_no_outlier <- visitation %>%
+  mutate(across(all_of(resort_cols), winsorize))
+
+```
+
+## Forecast
+
+### Preparation
+
+```{r}
+library(dplyr); library(tidyr); library(forecast); library(purrr)
+rmse <- function(a,p) sqrt(mean((a-p)^2, na.rm=TRUE))
+
+# long format from your cleaned visitation
+vis_long <- visitation_no_outlier %>%
+  pivot_longer(-c(Year, Week), names_to="Resort", values_to="Visitors")
+
+```
+
+### Test the 3 models (ETS, ARIMA and Dynamic Regression) and select the optimal one
+
+```{r}
+# n_test = number of weeks for testing (2 winters = 30 weeks). Nếu chuỗi ngắn, tự giảm.
+n_test <- 30
+
+fit_pick_forecast <- function(df_resort){   # df_resort: Year, Week, Visitors for ONE resort
+  df_resort <- df_resort %>% arrange(Year, Week)
+  y <- ts(df_resort$Visitors, start = c(min(df_resort$Year), 1), frequency = 15)
+
+  # Predictor for Dynamic Regression
+  X <- as.matrix(df_resort[, c("Year","Week")])
+
+  n_test_local <- min(n_test, max(10, floor(length(y)/3)))  
+  y_tr <- head(y, length(y) - n_test_local)
+  y_te <- tail(y, n_test_local)
+  X_tr <- head(X, length(y_tr))
+  X_te <- tail(X, length(y_te))
+
+  # --- 1) ARIMA
+  fit_arima <- auto.arima(y_tr)
+  fc_arima  <- forecast(fit_arima, h = n_test_local)
+  rmse_arima <- rmse(y_te, fc_arima$mean)
+
+  # --- 2) ETS
+  fit_ets <- ets(y_tr)
+  fc_ets  <- forecast(fit_ets, h = n_test_local)
+  rmse_ets <- rmse(y_te, fc_ets$mean)
+
+  # --- 3) Dynamic Regression (ARIMA + xreg)
+  fit_dyn <- tryCatch(auto.arima(y_tr, xreg = X_tr), error = function(e) NULL)
+  if(!is.null(fit_dyn)){
+    fc_dyn   <- forecast(fit_dyn, xreg = X_te, h = n_test_local)
+    rmse_dyn <- rmse(y_te, fc_dyn$mean)
+  } else rmse_dyn <- Inf
+
+  # Best model
+  rmses <- c(ARIMA = rmse_arima, ETS = rmse_ets, DYN = rmse_dyn)
+  best  <- names(which.min(rmses))
+
+  # Fit final model onto dataset and forecast 2026 (h = 15weeks)
+  if(best == "ARIMA"){
+    fit_full <- auto.arima(y)
+    fc_2026  <- forecast(fit_full, h = 15)$mean
+  } else if(best == "ETS"){
+    fit_full <- ets(y)
+    fc_2026  <- forecast(fit_full, h = 15)$mean
+  } else {
+    fit_full <- auto.arima(y, xreg = X)
+    X_fut <- cbind(Year = rep(max(df_resort$Year) + 1, 15),
+                   Week = 1:15)
+    fc_2026 <- forecast(fit_full, xreg = as.matrix(X_fut), h = 15)$mean
+  }
+
+  list(
+    rmse_row = tibble(Resort = unique(df_resort$Resort),
+                      RMSE_ARIMA = rmse_arima,
+                      RMSE_ETS   = rmse_ets,
+                      RMSE_DYN   = rmse_dyn,
+                      BestModel  = best),
+    fc_row   = tibble(Resort = unique(df_resort$Resort),
+                      Week   = 1:15,
+                      Forecast_2026 = as.numeric(fc_2026),
+                      BestModel = best)
+  )
+}
+
+# Run for all resorts
+by_resort <- vis_long %>%
+  group_by(Resort) %>%
+  group_split()
+
+out_list <- map(by_resort, ~ fit_pick_forecast(.x %>% select(Year, Week, Visitors, Resort)))
+
+rmse_table <- bind_rows(map(out_list, "rmse_row"))
+forecast_2026_all <- bind_rows(map(out_list, "fc_row"))
+
+```
+
+### Compare models
+
+```{r}
+rmse_table %>% arrange(BestModel, RMSE_ARIMA, RMSE_ETS, RMSE_DYN)
+forecast_2026_all %>% arrange(Resort, Week) %>% head(20)
+
+```
+
+### Plot 2026 for 1 resort (Perisher) (for reference only)
+
+```{r}
+library(ggplot2)
+plot_fc_2026 <- function(resort_name){
+  hist_mean <- vis_long %>%
+    filter(Resort == resort_name) %>%
+    group_by(Week) %>%
+    summarise(mean_hist = mean(Visitors), .groups = "drop")
+
+  fc_df <- forecast_2026_all %>% filter(Resort == resort_name)
+
+  ggplot() +
+    geom_line(data = hist_mean, aes(Week, mean_hist), linetype="dashed") +
+    geom_line(data = fc_df, aes(Week, Forecast_2026), color="steelblue", linewidth=1.1) +
+    labs(title = paste("Forecast 2026 vs Historical Mean —", resort_name),
+         x = "Week (1–15)", y = "Visitors") +
+    theme_minimal()
+}
+
+# Example:
+plot_fc_2026("Perisher")
+
+```
+
+## Combine climate + visits
+
+Standardize climate by weeks (June-September ⇒ 15 weeks)
+
+```{r}
+# (A) Create climate_weekly & climatology by week
+if (!exists("climate_weekly")) {
+  library(dplyr); library(lubridate)
+  climate_weekly <- climate_no_outlier %>%
+    mutate(Date = make_date(Year, Month, Day)) %>%
+    group_by(Year) %>% arrange(Date, .by_group = TRUE) %>%
+    filter(row_number() <= 105) %>%                      # 15 weeks x 7 days
+    mutate(Week = ((row_number()-1) %/% 7) + 1) %>%
+    group_by(Year, Week) %>%
+    summarise(
+      avg_max_temp = mean(`Maximum temperature (Degree C)`, na.rm = TRUE),
+      avg_min_temp = mean(`Minimum temperature (Degree C)`, na.rm = TRUE),
+      avg_rain     = mean(`Rainfall amount (millimetres)`, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# (B) Climatology by weeks (average over years; exclude 2020)
+clim_typical <- climate_weekly %>%
+  filter(Year != 2020) %>%  
+  group_by(Week) %>%
+  summarise(
+    clim_min  = mean(avg_min_temp, na.rm = TRUE),
+    clim_rain = mean(avg_rain,     na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+Create **Climate Score,** aiming for
+
+-   Min temp: logistic around 0 °C .
+-   Rain: minimum
+
+```{r}
+# weights
+w_temp <- 0.6; w_rain <- 0.4
+k <- 1.2  
+
+clim_scores <- clim_typical %>%
+  mutate(
+    min_temp_score = 1 / (1 + exp(k * (clim_min - 0))),     # <=0°C → ~0.5–1
+    rain_norm  = (clim_rain - min(clim_rain)) / (diff(range(clim_rain)) + 1e-9),
+    rain_score = 1 - rain_norm,
+    Climate_score = w_temp * min_temp_score + w_rain * rain_score
+  ) %>%
+  select(Week, Climate_score)
+
+```
+
+## Standardize **crowd** from forecast & compute **Composite Score**
+
+-   Visitor_norm: min–max (0 = quite, 1 = crowded).
+
+-   Composite = w_climate · Climate + w_crowd · (1 − Visitor_norm)
+
+```{r}
+# weights
+w_climate <- 0.5; w_crowd <- 0.5
+
+# Stop if do not have forecast_2026_all from Step 4
+stopifnot(exists("forecast_2026_all"))
+
+# Standardize crowd 
+rng <- range(forecast_2026_all$Forecast_2026, na.rm = TRUE)
+
+scored_2026 <- forecast_2026_all %>%
+  mutate(Visitor_norm = (Forecast_2026 - rng[1]) / (diff(rng) + 1e-9)) %>%  # 0=ít
+  left_join(clim_scores, by = "Week") %>%
+  mutate(
+    PriceFeat_score = 0.5,  # placeholder 
+    Composite = w_climate * Climate_score +
+                w_crowd   * (1 - Visitor_norm) +
+                w_price   * PriceFeat_score
+  )
+
+```
+
+## For VIC, choose 1 quite and 1 lively resort, same for NSW. And choose optimal weeks for each resort
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+
+# 1) Resort by state (lively vs quiet) —
+
+# Needed: scored_2026 (Resort, Week, Forecast_2026, Climate_score, Visitor_norm, BestModel)
+
+resort_state <- tribble(
+  ~Resort,         ~State,
+  "Mt. Buller",    "VIC",
+  "Mt. Hotham",    "VIC",
+  "Falls Creek",   "VIC",
+  "Mt. Baw Baw",   "VIC",
+  "Mt. Stirling",  "VIC",
+  "Perisher",      "NSW",
+  "Thredbo",       "NSW",
+  "Charlotte Pass","NSW",
+  "Selwyn",        "NSW"
+)
+
+scored_2026_state <- scored_2026 %>% 
+  left_join(resort_state, by="Resort")
+
+# crowded level (by resort) — to cluster lively/quiet
+resort_busyness <- scored_2026_state %>%
+  group_by(Resort, State) %>%
+  summarise(mean_forecast = mean(Forecast_2026), .groups = "drop")
+
+pick_vic <- resort_busyness %>% filter(State=="VIC") %>%
+  summarise(lively = Resort[which.max(mean_forecast)],
+            quiet  = Resort[which.min(mean_forecast)])
+
+pick_nsw <- resort_busyness %>% filter(State=="NSW") %>%
+  summarise(lively = Resort[which.max(mean_forecast)],
+            quiet  = Resort[which.min(mean_forecast)])
+
+pick_vic; pick_nsw
+pick_list <- c(pick_vic$lively, pick_vic$quiet, pick_nsw$lively, pick_nsw$quiet)
+
+#2)  “crowd by resort” và criteria
+quiet_cut <- 0.40       # <=40% crowded → quiet 
+N_best    <- 3          # 3 weeks for each resort
+
+per_resort_scored <- scored_2026_state %>%
+  filter(Resort %in% pick_list, Week >= 4, Week <= 12) %>%
+  group_by(Resort) %>%
+  mutate(
+    CrowdPercentile = percent_rank(Forecast_2026),     # 0=quiet, 1=lively
+    IsQuiet = CrowdPercentile <= quiet_cut,
+    ClimateRank = rank(-Climate_score, ties.method="first")
+  ) %>%
+  ungroup()
+
+
+```
+
+```{r}
+avg_vis_2026 <- forecast_2026_all %>%
+  group_by(Resort) %>%
+  summarise(avg_visitors = mean(Forecast_2026), .groups="drop") %>%
+  left_join(resort_state, by="Resort") %>%
+  group_by(State) %>%
+  mutate(
+    Type = case_when(
+      avg_visitors == max(avg_visitors) ~ "Lively",
+      avg_visitors == min(avg_visitors) ~ "Quiet",
+      TRUE ~ "Other"
+    )
+  )
+
+ggplot(avg_vis_2026, aes(x = reorder(Resort, avg_visitors),
+                         y = avg_visitors, fill = Type)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Lively"="darkblue", "Quiet"="lightblue", "Other"="grey80")) +
+  facet_wrap(~State, scales="free_y") +
+  labs(title = "Average Forecasted Visitors (2026) by Resort",
+       x = "Resort", y = "Avg Visitors (2026)", fill="Category") +
+  theme_minimal()
+
+
+```
+
+### Determine optimal weeks
+
+#### Logic for choosing weeks
+
+-    **Falls Creek (VIC – lively)** & **Perisher (NSW – lively)**\
+    → Choose highest **ClimateScore (best climate**), no need to filter crowd (cause expected to be crowded)
+
+-    **Mt Stirling (VIC – quiet)** & **Charlotte Pass (NSW – quiet)**\
+    → Choose quiet weeks and **ClimateScore \>= median resort** (not too bad).
+
+```{r}
+library(dplyr)
+
+# resort đã chọn
+chosen_resorts <- c("Falls Creek","Mt. Stirling","Perisher","Charlotte Pass")
+
+per_resort <- scored_2026 %>%
+  filter(Resort %in% chosen_resorts, Week >= 4, Week <= 12) %>%
+  group_by(Resort) %>%
+  mutate(
+    CrowdPercentile = percent_rank(Forecast_2026),   # 0=ít, 1=đông (nội bộ resort)
+    clim_median = median(Climate_score, na.rm=TRUE)
+  ) %>%
+  ungroup()
+
+N_best <- 3   # số tuần optimal muốn lấy
+
+# --- Lively resorts: Falls Creek, Perisher ---
+lively_weeks <- per_resort %>%
+  filter(Resort %in% c("Falls Creek","Perisher")) %>%
+  group_by(Resort) %>%
+  arrange(desc(Climate_score), Forecast_2026, .by_group=TRUE) %>%
+  slice(1:N_best) %>%
+  ungroup() %>%
+  transmute(
+    Resort, Week,
+    ForecastVisitors = round(Forecast_2026),
+    CrowdPercentile = round(CrowdPercentile,2),
+    ClimateScore = round(Climate_score,3),
+    Type="Lively"
+  )
+
+# --- Quiet resorts: Mt Stirling, Charlotte Pass ---
+quiet_weeks <- per_resort %>%
+  filter(Resort %in% c("Mt. Stirling","Charlotte Pass"),
+         CrowdPercentile <= 0.40,       # top 40% vắng nhất
+         Climate_score >= clim_median) %>%
+  group_by(Resort) %>%
+  arrange(Forecast_2026, desc(Climate_score), .by_group=TRUE) %>%
+  slice(1:N_best) %>%
+  ungroup() %>%
+  transmute(
+    Resort, Week,
+    ForecastVisitors = round(Forecast_2026),
+    CrowdPercentile = round(CrowdPercentile,2),
+    ClimateScore = round(Climate_score,3),
+    Type="Quiet"
+  )
+
+optimal_weeks_final <- bind_rows(lively_weeks, quiet_weeks) %>%
+  arrange(Type, Resort, Week)
+
+optimal_weeks_final
+
+```
+
+```{r}
+library(gt)
+
+optimal_weeks_final %>%
+  gt() %>%
+  tab_header(title = "Optimal Weeks by Resort (2026)") %>%
+  data_color(
+    columns = vars(ClimateScore),
+    colors = scales::col_numeric(
+      palette = c("lightblue", "darkblue"),
+      domain = NULL)
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightgrey"),
+    locations = cells_body(columns = vars(Type), rows = Type == "Quiet")
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightsteelblue"),
+    locations = cells_body(columns = vars(Type), rows = Type == "Lively")
+  )
+
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Ví dụ: Perisher
+df_perisher <- scored_2026 %>% filter(Resort == "Perisher", Week >= 4, Week <= 12)
+
+# Giả sử bạn đã có bảng 'optimal_weeks_final' từ Part 5
+highlight_weeks <- optimal_weeks_final %>% filter(Resort == "Perisher") %>% pull(Week)
+
+ggplot(df_perisher, aes(x = Week, y = Climate_score, size = Forecast_2026)) +
+  geom_point(alpha=0.6, color="steelblue") +
+  geom_point(data = df_perisher %>% filter(Week %in% highlight_weeks),
+             aes(x = Week, y = Climate_score),
+             color="red", size=4, shape=21, stroke=1.2) +
+  geom_text_repel(data = df_perisher %>% filter(Week %in% highlight_weeks),
+                  aes(label = Week), color="red") +
+  labs(title="Optimal Weeks for Perisher (2026)",
+       x="Week", y="Climate Score", size="Forecast Visitors") +
+  theme_minimal()
+
+```
